@@ -21,6 +21,7 @@ public class PluginLists
 
     private void InitListTemplate()
     {
+        // just serialize some nonsense URLs so that people can see how the structure is meant to be
         var list = new PluginLinkList();
         list.Plugins.Add("http://somewhere.net/plugin-abc");
         list.Plugins.Add("http://somewhere.net/plugin-xyz");
