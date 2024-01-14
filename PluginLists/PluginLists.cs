@@ -1,21 +1,35 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace PluginLists;
 
-public class PluginLists
+public partial class PluginLists
 {
+    [GeneratedRegex(@"(\w+)\s*=\s*(null|false|true|\x22[^\x22]+\x22)", RegexOptions.IgnoreCase, "en-US")]
+    private static partial Regex VariableAssignmentRegex();
+    [GeneratedRegex(@"new Version\((\d+),\s*(\d+)\)", RegexOptions.IgnoreCase, "en-US")]
+    private static partial Regex NewVersionRegex();
+    [GeneratedRegex(@"(https?://(\w+\.)?github.com)/([^/]+)/([^/]+)/?", RegexOptions.IgnoreCase, "en-US")]
+    private static partial Regex GithubRepo();
     private const string LocalListUrl = "pluginlist.json";
     private readonly HttpClient _httpClient = new();
-    private readonly ISet<string> _plugins;
+    private readonly ISet<string> _pluginUrls;
     private readonly HashSet<string> _lists;
-    private int _tasksRunning;
+    private readonly Dictionary<string, PluginDescription> _plugins;
+    private readonly Dictionary<string, FlaxProject> _projects;
+    private int _scannerTasksRunning;
+    private int _getDetailsTasksRunning;
 
     public PluginLists()
     {
-        _plugins = new HashSet<string>();
+        _pluginUrls = new HashSet<string>();
         _lists = new HashSet<string>();
-        _tasksRunning = 0;
+        _plugins = new Dictionary<string, PluginDescription>();
+        _projects = new Dictionary<string, FlaxProject>();
+        _scannerTasksRunning = 0;
+        _getDetailsTasksRunning = 0;
+        _httpClient.DefaultRequestHeaders.Add("User-Agent", "FlaxPluginList (github.com/nothingTVatYT/FlaxPluginScanner)");
         Init();
     }
 
@@ -58,7 +72,7 @@ public class PluginLists
         foreach (var url in localList.Plugins)
         {
             Debug.WriteLine($"Adding {url}");
-            lock (_plugins) _plugins.Add(url);
+            lock (_pluginUrls) _pluginUrls.Add(url);
         }
 
         foreach (var url in localList.Lists)
@@ -74,14 +88,14 @@ public class PluginLists
             if (_lists.Contains(url))
                 return;
         }
-        Interlocked.Increment(ref _tasksRunning);
+        Interlocked.Increment(ref _scannerTasksRunning);
         lock (_lists) _lists.Add(url);
         var stream = await _httpClient.GetStreamAsync(url);
         var list = JsonSerializer.Deserialize<PluginLinkList>(stream);
         if (list == null)
         {
             Debug.WriteLine($"Not a plugin link list: {url}");
-            Interlocked.Decrement(ref _tasksRunning);
+            Interlocked.Decrement(ref _scannerTasksRunning);
             return;
         }
 
@@ -89,7 +103,11 @@ public class PluginLists
         foreach (var pluginUrl in list.Plugins)
         {
             Debug.WriteLine($"Adding {pluginUrl}");
-            lock (_plugins) _plugins.Add(pluginUrl);
+            lock (_pluginUrls)
+            {
+                if (_pluginUrls.Add(pluginUrl))
+                    FindPluginDescription(pluginUrl);
+            }
         }
 
         // scan list links
@@ -99,7 +117,173 @@ public class PluginLists
             AddList(listUrl);
         }
 
-        Interlocked.Decrement(ref _tasksRunning);
+        Interlocked.Decrement(ref _scannerTasksRunning);
+    }
+
+    private async void FindPluginDescription(string url)
+    {
+        var match = GithubRepo().Match(url);
+        if (!match.Success)
+        {
+            Debug.WriteLine($"Not a github URL: {url}");
+            return;
+        }
+
+        var owner = match.Groups[3].Value;
+        var repository = match.Groups[4].Value;
+        if (string.IsNullOrEmpty(owner) || string.IsNullOrEmpty(repository))
+        {
+            Debug.WriteLine($"not a github repository URL: {url}");
+            for (var i = 0; i < match.Groups.Count; i++)
+                Debug.WriteLine($" group {i} {match.Groups[i].Value}");
+            return;
+        }
+        Interlocked.Increment(ref _getDetailsTasksRunning);
+        // get default branch
+        var requestUri = $"https://api.github.com/repos/{owner}/{repository}";
+        var repositoryDescription = await GetObjectFromUrl<RepositoryDescription>(requestUri);
+        var branch = repositoryDescription?.default_branch;
+        if (string.IsNullOrEmpty(branch))
+        {
+            Debug.WriteLine($"Could not get default branch for {url}.");
+            Interlocked.Decrement(ref _getDetailsTasksRunning);
+            return;
+        }
+
+        // get FlaxProject and Source folder hash
+        var treesResult =
+            await GetObjectFromUrl<TreesResult>($"https://api.github.com/repos/{owner}/{repository}/git/trees/{branch}");
+        var sourceFolderUrl = "";
+        FlaxProject? flaxProject = null;
+        if (treesResult is { tree: not null })
+        {
+            foreach (var tree in treesResult.tree)
+            {
+                if (tree.path != null && tree.path.EndsWith(".flaxproj") && "blob".Equals(tree.type) && tree.url != null)
+                {
+                    flaxProject = await GetObjectFromBlob<FlaxProject>(tree.url);
+                    if (flaxProject != null)
+                        lock (_projects)
+                            _projects[url] = flaxProject;
+                }
+
+                if ("Source".Equals(tree.path) && "tree".Equals(tree.type))
+                {
+                    sourceFolderUrl = tree.url;
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(sourceFolderUrl) && flaxProject is { Name: not null })
+        {
+            var sourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFolderUrl);
+            if (sourceTreesResult is { tree: not null })
+            {
+                foreach (var sourceFileTree in sourceTreesResult.tree)
+                {
+                    if (flaxProject.Name.Equals(sourceFileTree.path))
+                    {
+                        // this is the Source folder for the GamePlugin
+                        var gameSourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFileTree.url);
+                        if (gameSourceTreesResult is { tree: not null })
+                        {
+                            // looking for the GamePlugin constructor
+                            // the name could be anything
+                            foreach (var gameSourceFilesResult in gameSourceTreesResult.tree)
+                            {
+                                if (gameSourceFilesResult.path != null && gameSourceFilesResult.path.EndsWith(".cs"))
+                                {
+                                    var text = await GetTextFile(gameSourceFilesResult.url);
+                                    if (text.Contains("new PluginDescription"))
+                                    {
+                                        var pluginDescription = ParsePluginDescription(text);
+                                        if (pluginDescription != null)
+                                            lock (_plugins) _plugins[url] = pluginDescription;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+
+        Interlocked.Decrement(ref _getDetailsTasksRunning);
+    }
+
+    private async Task<T?> GetObjectFromUrl<T>(string? url)
+    {
+        if (url == null)
+            return default;
+        try
+        {
+            var stream = await _httpClient.GetStreamAsync(url);
+            var result = JsonSerializer.Deserialize<T>(stream);
+            if (result == null)
+                Debug.WriteLine($"Could not get a {typeof(T)} from {url}.");
+            return result;
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"Could not access {url}: {e}");
+            return default;
+        }
+    }
+
+    private async Task<T?> GetObjectFromBlob<T>(string url)
+    {
+        var text = await GetTextFile(url);
+        if (string.IsNullOrEmpty(text))
+            return default;
+        try
+        {
+            var result = JsonSerializer.Deserialize<T>(text);
+            return result;
+        }
+        catch (Exception e)
+        {
+            File.WriteAllText("/tmp/blob.txt", text);
+            Debug.WriteLine($"Could not deserialize to a {typeof(T)}: {e}");
+            Debug.WriteLine($" The json is: {text}");
+            return default;
+        }
+    }
+
+    private async Task<string> GetTextFile(string? url)
+    {
+        if (url == null)
+            return "";
+        try
+        {
+            var stream = await _httpClient.GetStreamAsync(url);
+            var blobResult = JsonSerializer.Deserialize<BlobResult>(stream);
+            if (blobResult is not { content: not null }) return "";
+            var text = System.Text.Encoding.ASCII.GetString(Convert.FromBase64String(blobResult.content));
+            var idx = text.IndexOf('{');
+            if (idx > 0)
+                text = text[idx..];
+            // if (!string.IsNullOrEmpty(text))
+            //     text = text[2..];
+            return text;
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"Could not get text file from {url}: {e}");
+            return "";
+        }
+    }
+
+    private PluginDescription? ParsePluginDescription(string text)
+    {
+        var start = text.IndexOf("new PluginDescription", StringComparison.Ordinal);
+        var openBracket = text.IndexOf("{", start, StringComparison.Ordinal);
+        var closeBracket = text.IndexOf("}", openBracket, StringComparison.Ordinal);
+        var initCode = text.Substring(openBracket, closeBracket - openBracket + 1);
+        // convert to json
+        var replaced = VariableAssignmentRegex().Replace(NewVersionRegex().Replace(initCode, @"{ Major: \1, Minor: \2 }"), "\"\\1\" : \\2");
+        return JsonSerializer.Deserialize<PluginDescription>(replaced);
     }
 
     /// <summary>
@@ -108,7 +292,12 @@ public class PluginLists
     /// <returns>true if at least one tasks is still active</returns>
     public bool IsScanning()
     {
-        return _tasksRunning > 0;
+        return _scannerTasksRunning > 0;
+    }
+
+    public bool IsGettingDetails()
+    {
+        return _getDetailsTasksRunning > 0;
     }
 
     /// <summary>
@@ -118,7 +307,14 @@ public class PluginLists
     public List<string> GetPluginUrls()
     {
         List<string> result;
-        lock (_plugins) result = _plugins.ToList();
+        lock (_pluginUrls) result = _pluginUrls.ToList();
         return result;
+    }
+
+    public PluginDescription? GetPluginDescription(string url)
+    {
+        PluginDescription? p;
+        lock (_plugins) _plugins.TryGetValue(url, out p);
+        return p;
     }
 }
