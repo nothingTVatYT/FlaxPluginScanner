@@ -6,9 +6,11 @@ namespace PluginLists;
 
 public partial class PluginLists
 {
+    [GeneratedRegex(@",\s*}")]
+    private static partial Regex CommaBeforeClosingBracket();
     [GeneratedRegex(@"(\w+)\s*=\s*(null|false|true|\x22[^\x22]+\x22)", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex VariableAssignmentRegex();
-    [GeneratedRegex(@"new Version\((\d+),\s*(\d+)\)", RegexOptions.IgnoreCase, "en-US")]
+    [GeneratedRegex(@"Version = new Version\((\d+),\s*(\d+)\)", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex NewVersionRegex();
     [GeneratedRegex(@"(https?://(\w+\.)?github.com)/([^/]+)/([^/]+)/?", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex GithubRepo();
@@ -20,9 +22,12 @@ public partial class PluginLists
     private readonly Dictionary<string, FlaxProject> _projects;
     private int _scannerTasksRunning;
     private int _getDetailsTasksRunning;
+    private JsonSerializerOptions _jsonOptions = new(JsonSerializerOptions.Default);
 
     public PluginLists()
     {
+        _jsonOptions.WriteIndented = true;
+        _jsonOptions.IncludeFields = true;
         _pluginUrls = new HashSet<string>();
         _lists = new HashSet<string>();
         _plugins = new Dictionary<string, PluginDescription>();
@@ -244,7 +249,6 @@ public partial class PluginLists
         }
         catch (Exception e)
         {
-            File.WriteAllText("/tmp/blob.txt", text);
             Debug.WriteLine($"Could not deserialize to a {typeof(T)}: {e}");
             Debug.WriteLine($" The json is: {text}");
             return default;
@@ -264,8 +268,6 @@ public partial class PluginLists
             var idx = text.IndexOf('{');
             if (idx > 0)
                 text = text[idx..];
-            // if (!string.IsNullOrEmpty(text))
-            //     text = text[2..];
             return text;
         }
         catch (Exception e)
@@ -281,9 +283,13 @@ public partial class PluginLists
         var openBracket = text.IndexOf("{", start, StringComparison.Ordinal);
         var closeBracket = text.IndexOf("}", openBracket, StringComparison.Ordinal);
         var initCode = text.Substring(openBracket, closeBracket - openBracket + 1);
-        // convert to json
-        var replaced = VariableAssignmentRegex().Replace(NewVersionRegex().Replace(initCode, @"{ Major: \1, Minor: \2 }"), "\"\\1\" : \\2");
-        return JsonSerializer.Deserialize<PluginDescription>(replaced);
+        // replace Version constructor with a string literal
+        var replaced1 = NewVersionRegex().Replace(initCode, "\"Version\": \"$1.$2\"");
+        // replace variable assignments with json node syntax
+        var replaced2 = VariableAssignmentRegex().Replace(replaced1, "\"$1\" : $2");
+        // remove comma before closing bracket
+        var replaced = CommaBeforeClosingBracket().Replace(replaced2, "}");
+        return JsonSerializer.Deserialize<PluginDescription>(replaced, _jsonOptions);
     }
 
     /// <summary>
