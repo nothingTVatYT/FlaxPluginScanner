@@ -18,3 +18,5 @@ foreach (var url in pl.GetPluginUrls())
     if (desc != null)
         Console.WriteLine($"{desc.Name} {desc.Version} {desc.Description}");
 }
+
+pl.SavePluginsCache();

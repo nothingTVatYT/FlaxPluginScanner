@@ -14,7 +14,7 @@ public partial class PluginLists
     private static partial Regex NewVersionRegex();
     [GeneratedRegex(@"(https?://(\w+\.)?github.com)/([^/]+)/([^/]+)/?", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex GithubRepo();
-    private const string LocalListUrl = "pluginlist.json";
+    private string LocalListUrl;
     private readonly HttpClient _httpClient = new();
     private readonly ISet<string> _pluginUrls;
     private readonly HashSet<string> _lists;
@@ -35,6 +35,19 @@ public partial class PluginLists
         _scannerTasksRunning = 0;
         _getDetailsTasksRunning = 0;
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "FlaxPluginList (github.com/nothingTVatYT/FlaxPluginScanner)");
+        var tokenFile = Environment.GetEnvironmentVariable("GH_TOKEN");
+
+        if (!string.IsNullOrEmpty(tokenFile))
+        {
+            var token = File.ReadAllText(tokenFile);
+            _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer " + token.ReplaceLineEndings(""));
+        }
+        _httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
+	    var projectDir = Environment.GetEnvironmentVariable("PROJECT_DIR");
+	    if (!string.IsNullOrEmpty(projectDir))
+		    LocalListUrl = projectDir + "/pluginlist.json";
+	    else
+		    LocalListUrl = "pluginlist.json";
         Init();
     }
 
@@ -322,5 +335,14 @@ public partial class PluginLists
         PluginDescription? p;
         lock (_plugins) _plugins.TryGetValue(url, out p);
         return p;
+    }
+
+    public void SavePluginsCache()
+    {
+        var cache = new PluginsCache();
+        foreach (var pl in _plugins.Values)
+            cache.Plugins.Add(pl);
+        using var stream = File.OpenWrite("plugins.cache");
+        JsonSerializer.Serialize(stream, cache, _jsonOptions);
     }
 }
