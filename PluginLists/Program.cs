@@ -14,6 +14,9 @@ while (pl.IsScanning() || pl.IsGettingDetails())
 foreach (var url in pl.GetPluginUrls())
 {
     Console.WriteLine(url);
+    var flaxProject = pl.GetFlaxProject(url);
+    if (flaxProject != null)
+        Console.WriteLine($"{flaxProject.Name} {flaxProject.Version} {flaxProject.Company} {flaxProject.Copyright}");
     var desc = pl.GetPluginDescription(url);
     if (desc != null)
         Console.WriteLine($"{desc.Name} {desc.Version} {desc.Description}");

@@ -8,9 +8,11 @@ public partial class PluginLists
 {
     [GeneratedRegex(@",\s*}")]
     private static partial Regex CommaBeforeClosingBracket();
-    [GeneratedRegex(@"(\w+)\s*=\s*(null|false|true|\x22[^\x22]+\x22)", RegexOptions.IgnoreCase, "en-US")]
+    [GeneratedRegex(@"(\w+)\s*=\s*(null|false|true|\x22[^\x22]*\x22)", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex VariableAssignmentRegex();
-    [GeneratedRegex(@"Version = new Version\((\d+),\s*(\d+)\)", RegexOptions.IgnoreCase, "en-US")]
+    [GeneratedRegex(@"Version = new Version\(\)", RegexOptions.IgnoreCase, "en-US")]
+    private static partial Regex NewEmptyVersionRegex();
+    [GeneratedRegex(@"Version = new Version\((\d+),\s*(\d+),?\s*\d*\)", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex NewVersionRegex();
     [GeneratedRegex(@"(https?://(\w+\.)?github.com)/([^/]+)/([^/]+)/?", RegexOptions.IgnoreCase, "en-US")]
     private static partial Regex GithubRepo();
@@ -43,11 +45,11 @@ public partial class PluginLists
             _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer " + token.ReplaceLineEndings(""));
         }
         _httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
-	    var projectDir = Environment.GetEnvironmentVariable("PROJECT_DIR");
-	    if (!string.IsNullOrEmpty(projectDir))
-		    LocalListUrl = projectDir + "/pluginlist.json";
-	    else
-		    LocalListUrl = "pluginlist.json";
+	var projectDir = Environment.GetEnvironmentVariable("PROJECT_DIR");
+	if (!string.IsNullOrEmpty(projectDir))
+		LocalListUrl = projectDir + "/pluginlist.json";
+	else
+		LocalListUrl = "pluginlist.json";
         Init();
     }
 
@@ -90,7 +92,10 @@ public partial class PluginLists
         foreach (var url in localList.Plugins)
         {
             Debug.WriteLine($"Adding {url}");
-            lock (_pluginUrls) _pluginUrls.Add(url);
+            bool added;
+            lock (_pluginUrls) added = _pluginUrls.Add(url);
+            if (added)
+                FindPluginDescription(url);
         }
 
         foreach (var url in localList.Lists)
@@ -191,41 +196,64 @@ public partial class PluginLists
                 }
             }
         }
-
-        if (!string.IsNullOrEmpty(sourceFolderUrl) && flaxProject is { Name: not null })
+        else
         {
-            var sourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFolderUrl);
-            if (sourceTreesResult is { tree: not null })
+            Debug.WriteLine($"Could not get directory for {url}");
+            Interlocked.Decrement(ref _getDetailsTasksRunning);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(sourceFolderUrl))
+        {
+            Debug.WriteLine($"Could not get Source directory for {url}");
+            Interlocked.Decrement(ref _getDetailsTasksRunning);
+            return;
+        }
+
+        if (flaxProject is not { Name: not null })
+        {
+            Debug.WriteLine(
+                $"Could not get a flax project file for {url}");
+            Interlocked.Decrement(ref _getDetailsTasksRunning);
+            return;
+        }
+
+        var sourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFolderUrl);
+        if (sourceTreesResult is not { tree: not null })
+        {
+            Debug.WriteLine(
+                $"Could not get directory for Source folder for {url}");
+            Interlocked.Decrement(ref _getDetailsTasksRunning);
+            return;
+        }
+
+        foreach (var sourceFileTree in sourceTreesResult.tree)
+        {
+            if (flaxProject.Name.Equals(sourceFileTree.path))
             {
-                foreach (var sourceFileTree in sourceTreesResult.tree)
+                // this is the Source folder for the GamePlugin
+                var gameSourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFileTree.url);
+                if (gameSourceTreesResult is { tree: not null })
                 {
-                    if (flaxProject.Name.Equals(sourceFileTree.path))
+                    // looking for the GamePlugin constructor
+                    // the name could be anything
+                    foreach (var gameSourceFilesResult in gameSourceTreesResult.tree)
                     {
-                        // this is the Source folder for the GamePlugin
-                        var gameSourceTreesResult = await GetObjectFromUrl<TreesResult>(sourceFileTree.url);
-                        if (gameSourceTreesResult is { tree: not null })
+                        if (gameSourceFilesResult.path != null && gameSourceFilesResult.path.EndsWith(".cs"))
                         {
-                            // looking for the GamePlugin constructor
-                            // the name could be anything
-                            foreach (var gameSourceFilesResult in gameSourceTreesResult.tree)
+                            var text = await GetTextFile(gameSourceFilesResult.url);
+                            if (text.Contains("new PluginDescription"))
                             {
-                                if (gameSourceFilesResult.path != null && gameSourceFilesResult.path.EndsWith(".cs"))
-                                {
-                                    var text = await GetTextFile(gameSourceFilesResult.url);
-                                    if (text.Contains("new PluginDescription"))
-                                    {
-                                        var pluginDescription = ParsePluginDescription(text);
-                                        if (pluginDescription != null)
-                                            lock (_plugins) _plugins[url] = pluginDescription;
-                                        break;
-                                    }
-                                }
+                                var pluginDescription = ParsePluginDescription(text);
+                                if (pluginDescription != null)
+                                    lock (_plugins)
+                                        _plugins[url] = pluginDescription;
+                                break;
                             }
                         }
                     }
                 }
             }
-
         }
 
         Interlocked.Decrement(ref _getDetailsTasksRunning);
@@ -297,12 +325,23 @@ public partial class PluginLists
         var closeBracket = text.IndexOf("}", openBracket, StringComparison.Ordinal);
         var initCode = text.Substring(openBracket, closeBracket - openBracket + 1);
         // replace Version constructor with a string literal
-        var replaced1 = NewVersionRegex().Replace(initCode, "\"Version\": \"$1.$2\"");
+        var replacedV = NewEmptyVersionRegex().Replace(initCode, "\"Version\": \"1.0\"");
+        var replaced1 = NewVersionRegex().Replace(replacedV, "\"Version\": \"$1.$2\"");
         // replace variable assignments with json node syntax
         var replaced2 = VariableAssignmentRegex().Replace(replaced1, "\"$1\" : $2");
         // remove comma before closing bracket
         var replaced = CommaBeforeClosingBracket().Replace(replaced2, "}");
-        return JsonSerializer.Deserialize<PluginDescription>(replaced, _jsonOptions);
+        try
+        {
+            return JsonSerializer.Deserialize<PluginDescription>(replaced, _jsonOptions);
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"Caught an exception in plugin description parser: {e}");
+            Debug.WriteLine($"The json text is {replaced}");
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -334,6 +373,13 @@ public partial class PluginLists
     {
         PluginDescription? p;
         lock (_plugins) _plugins.TryGetValue(url, out p);
+        return p;
+    }
+
+    public FlaxProject? GetFlaxProject(string url)
+    {
+        FlaxProject? p;
+        lock (_projects) _projects.TryGetValue(url, out p);
         return p;
     }
 
