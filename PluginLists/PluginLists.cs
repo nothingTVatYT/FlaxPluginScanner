@@ -45,11 +45,11 @@ public partial class PluginLists
             _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer " + token.ReplaceLineEndings(""));
         }
         _httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
-	var projectDir = Environment.GetEnvironmentVariable("PROJECT_DIR");
-	if (!string.IsNullOrEmpty(projectDir))
-		LocalListUrl = projectDir + "/pluginlist.json";
-	else
-		LocalListUrl = "pluginlist.json";
+	    var projectDir = Environment.GetEnvironmentVariable("PROJECT_DIR");
+	    if (!string.IsNullOrEmpty(projectDir))
+		    LocalListUrl = projectDir + "/pluginlist.json";
+	    else
+		    LocalListUrl = "pluginlist.json";
         Init();
     }
 
